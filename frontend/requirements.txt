@@ -1,0 +1,17 @@
+# Microsoft Bot Framework for Python
+botbuilder-core==4.14.7
+botbuilder-schema==4.14.7
+aiohttp==3.11.0
+
+# HTTP requests for backend communication
+httpx==0.25.2
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Async utilities
+asyncio==3.4.3
+
+# Development dependencies
+pytest==7.4.3
+pytest-asyncio==0.21.1

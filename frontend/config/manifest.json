@@ -1,0 +1,66 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "YOUR-UNIQUE-GUID-HERE",
+  "packageName": "com.neudesic.srercabot",
+  "developer": {
+    "name": "Neudesic",
+    "websiteUrl": "https://www.neudesic.com",
+    "privacyUrl": "https://www.neudesic.com/privacy",
+    "termsOfUseUrl": "https://www.neudesic.com/terms"
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "name": {
+    "short": "SRE RCA Bot",
+    "full": "SRE Root Cause Analysis Bot"
+  },
+  "description": {
+    "short": "AI-powered root cause analysis for incidents",
+    "full": "Multi-agent system that analyzes Azure deployments, Application Insights logs, and GitHub issues to provide comprehensive root cause analysis for incidents."
+  },
+  "accentColor": "#FFFFFF",
+  "bots": [
+    {
+      "botId": "YOUR-BOT-ID-HERE",
+      "scopes": [
+        "personal",
+        "team",
+        "groupchat"
+      ],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": [
+            "personal",
+            "team",
+            "groupchat"
+          ],
+          "commands": [
+            {
+              "title": "help",
+              "description": "Show available commands and how to use the bot"
+            },
+            {
+              "title": "analyze",
+              "description": "Start root cause analysis for an incident"
+            },
+            {
+              "title": "status",
+              "description": "Check the status of an ongoing analysis"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": [
+    "identity",
+    "messageTeamMembers"
+  ],
+  "validDomains": []
+}
