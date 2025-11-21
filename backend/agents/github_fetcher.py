@@ -73,7 +73,7 @@ class GitHubFetcherAgent:
             else:
                 print(f"[GitHub Fetcher] No service filter (showing all commits)")
             
-            commits = fetch_recent_commits(
+            commits = await fetch_recent_commits(
                 repository=repository,
                 branch=branch,
                 since=since_dt,

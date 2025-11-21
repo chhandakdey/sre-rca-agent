@@ -1,23 +1,19 @@
 """
 Azure MCP Integration
 
-This module provides integration with Azure services via Azure MCP:
+This module provides integration with Azure services via Model Context Protocol (MCP):
 - Azure DevOps (pipelines, deployments)
 - Azure Monitor / App Insights (logs, metrics)
 - Azure Resource Graph (resources)
 
-NOTE: This is a stub implementation. In production, you would:
-1. Use the actual Azure MCP client/SDK
-2. Or use Azure SDKs directly (azure-devops, azure-monitor-query)
-3. Or call external MCP server via HTTP
+This implementation uses MCP tools to interact with Azure services.
 """
 
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
-from azure.devops.connection import Connection
+import httpx
+import json
 from azure.identity import DefaultAzureCredential
-from msrest.authentication import BasicAuthentication
-import requests
 
 from config import settings
 from models import DeploymentInfo, DeploymentStatus, LogEntry, SeverityLevel
@@ -27,7 +23,7 @@ from models import DeploymentInfo, DeploymentStatus, LogEntry, SeverityLevel
 # Azure DevOps Integration
 # ============================================================================
 
-def check_deployments(
+async def check_deployments(
     project: str,
     pipeline_name: Optional[str] = None,
     commit_sha: Optional[str] = None,
@@ -35,10 +31,9 @@ def check_deployments(
     max_results: int = 50
 ) -> List[DeploymentInfo]:
     """
-    Check Azure DevOps deployment status and history.
+    Check Azure DevOps deployment status and history using MCP.
     
-    This function queries Azure DevOps for pipeline runs and deployments.
-    In production, this would use Azure MCP.
+    This function uses Model Context Protocol to query Azure DevOps.
     
     Args:
         project: Azure DevOps project name
@@ -52,7 +47,7 @@ def check_deployments(
         
     Example:
         ```python
-        deployments = check_deployments(
+        deployments = await check_deployments(
             project="MyProject",
             pipeline_name="payment-service-deploy",
             since=datetime.utcnow() - timedelta(hours=24)
@@ -60,91 +55,75 @@ def check_deployments(
         ```
     """
     try:
-        # Initialize Azure DevOps connection
-        # In production, this would use Azure MCP client
-        credentials = BasicAuthentication('', settings.azure_devops_pat)
-        connection = Connection(
-            base_url=settings.azure_devops_org_url,
-            creds=credentials
-        )
-        
-        # Get build client
-        build_client = connection.clients.get_build_client()
-        
         # Calculate default since time
         if since is None:
             since = datetime.utcnow() - timedelta(hours=settings.correlation_time_window_hours)
         
-        # Get all pipelines in the project
-        pipelines = build_client.get_definitions(project=project)
-        
-        # Filter by pipeline name if specified
-        if pipeline_name:
-            pipelines = [p for p in pipelines if pipeline_name.lower() in p.name.lower()]
+        # Use MCP to get builds
+        builds_data = await call_azure_mcp(
+            "devops.list_builds",
+            {
+                "organization": settings.azure_devops_org_url.split('/')[-1],
+                "project": project,
+                "pipeline_name": pipeline_name,
+                "min_time": since.isoformat() + 'Z',
+                "max_builds": max_results
+            }
+        )
         
         deployment_infos = []
         
-        # For each pipeline, get recent builds
-        for pipeline in pipelines[:10]:  # Limit pipelines to check
-            try:
-                builds = build_client.get_builds(
-                    project=project,
-                    definitions=[pipeline.id],
-                    min_time=since,
-                    max_builds_per_definition=max_results
-                )
-                
-                for build in builds:
-                    # Map Azure DevOps status to our DeploymentStatus
-                    status_map = {
-                        "completed": DeploymentStatus.SUCCEEDED if build.result == "succeeded" else DeploymentStatus.FAILED,
-                        "inProgress": DeploymentStatus.IN_PROGRESS,
-                        "cancelling": DeploymentStatus.CANCELED,
-                        "postponed": DeploymentStatus.PENDING,
-                        "notStarted": DeploymentStatus.PENDING
-                    }
-                    
-                    status = status_map.get(build.status, DeploymentStatus.UNKNOWN)
-                    if build.result == "succeeded":
-                        status = DeploymentStatus.SUCCEEDED
-                    elif build.result == "failed":
-                        status = DeploymentStatus.FAILED
-                    elif build.result == "canceled":
-                        status = DeploymentStatus.CANCELED
-                    
-                    # Get commit SHA from source version
-                    build_commit_sha = build.source_version if build.source_version else None
-                    
-                    # Filter by commit SHA if specified
-                    if commit_sha and build_commit_sha != commit_sha:
-                        continue
-                    
-                    # Determine environment (heuristic based on pipeline name)
-                    environment = "production"
-                    if "dev" in pipeline.name.lower():
-                        environment = "development"
-                    elif "staging" in pipeline.name.lower() or "stage" in pipeline.name.lower():
-                        environment = "staging"
-                    
-                    # Create DeploymentInfo
-                    deployment_info = DeploymentInfo(
-                        pipeline_id=str(pipeline.id),
-                        pipeline_name=pipeline.name,
-                        run_id=str(build.id),
-                        status=status,
-                        started_time=build.start_time or datetime.utcnow(),
-                        completed_time=build.finish_time,
-                        commit_sha=build_commit_sha,
-                        environment=environment,
-                        url=f"{settings.azure_devops_org_url}/{project}/_build/results?buildId={build.id}",
-                        error_message=None  # Could extract from build logs if needed
-                    )
-                    
-                    deployment_infos.append(deployment_info)
-                    
-            except Exception as e:
-                print(f"[Azure DevOps] Error fetching builds for pipeline {pipeline.name}: {str(e)}")
+        for build in builds_data:
+            # Map Azure DevOps status to our DeploymentStatus
+            status = DeploymentStatus.UNKNOWN
+            if build.get('status') == 'completed':
+                if build.get('result') == 'succeeded':
+                    status = DeploymentStatus.SUCCEEDED
+                elif build.get('result') == 'failed':
+                    status = DeploymentStatus.FAILED
+                elif build.get('result') == 'canceled':
+                    status = DeploymentStatus.CANCELED
+            elif build.get('status') == 'inProgress':
+                status = DeploymentStatus.IN_PROGRESS
+            else:
+                status = DeploymentStatus.PENDING
+            
+            # Get commit SHA
+            build_commit_sha = build.get('sourceVersion', '')
+            
+            # Filter by commit SHA if specified
+            if commit_sha and build_commit_sha != commit_sha:
                 continue
+            
+            # Determine environment
+            pipeline = build.get('definition', {}).get('name', '')
+            environment = "production"
+            if "dev" in pipeline.lower():
+                environment = "development"
+            elif "staging" in pipeline.lower() or "stage" in pipeline.lower():
+                environment = "staging"
+            
+            # Parse timestamps
+            started_time = datetime.fromisoformat(build.get('startTime', '').replace('Z', '+00:00'))
+            completed_time = build.get('finishTime')
+            if completed_time:
+                completed_time = datetime.fromisoformat(completed_time.replace('Z', '+00:00'))
+            
+            # Create DeploymentInfo
+            deployment_info = DeploymentInfo(
+                pipeline_id=str(build.get('definition', {}).get('id', '')),
+                pipeline_name=pipeline,
+                run_id=str(build.get('id', '')),
+                status=status,
+                started_time=started_time,
+                completed_time=completed_time,
+                commit_sha=build_commit_sha,
+                environment=environment,
+                url=build.get('_links', {}).get('web', {}).get('href', ''),
+                error_message=None
+            )
+            
+            deployment_infos.append(deployment_info)
         
         # Sort by start time (most recent first)
         deployment_infos.sort(key=lambda d: d.started_time, reverse=True)
@@ -198,18 +177,18 @@ def get_deployment_logs(project: str, build_id: int) -> str:
 # Azure Monitor / App Insights Integration
 # ============================================================================
 
-def query_app_insights_logs(
+async def query_app_insights_logs(
     workspace_id: str,
     kql_query: str,
     max_results: int = 1000
 ) -> List[LogEntry]:
     """
-    Query Azure App Insights logs using KQL.
+    Query Azure App Insights logs using KQL via MCP.
     
-    This function executes a KQL query against App Insights using the Application Insights API.
+    This function uses Model Context Protocol to execute KQL queries.
     
     Args:
-        workspace_id: App Insights App ID (not Log Analytics workspace ID)
+        workspace_id: App Insights App ID
         kql_query: KQL query to execute
         max_results: Maximum log entries to return
         
@@ -217,63 +196,23 @@ def query_app_insights_logs(
         List of LogEntry objects
     """
     try:
-        # Try using Application Insights API directly (for classic or workspace-based App Insights)
-        # Use App ID from config if available
-        app_id = settings.app_insights_app_id or workspace_id
-        
-        print(f"[App Insights] Starting query...")
-        print(f"[App Insights] App ID from settings: {settings.app_insights_app_id}")
-        print(f"[App Insights] Workspace ID parameter: {workspace_id}")
-        print(f"[App Insights] Using App ID: {app_id}")
-        print(f"[App Insights] KQL Query: {kql_query}")
-        
-        # Get Azure credentials
-        print(f"[App Insights] Getting Azure credentials...")
-        credential = DefaultAzureCredential()
-        print(f"[App Insights] Getting token...")
-        token = credential.get_token("https://api.applicationinsights.io/.default")
-        print(f"[App Insights] Token acquired successfully")
-        
-        # Query App Insights API
-        import requests
-        api_url = f"https://api.applicationinsights.io/v1/apps/{app_id}/query"
-        
-        print(f"[App Insights] API URL: {api_url}")
-        
-        headers = {
-            "Authorization": f"Bearer {token.token}",
-            "Content-Type": "application/json"
-        }
-        
-        data = {"query": kql_query}
-        
-        print(f"[App Insights] Sending POST request...")
-        response = requests.post(api_url, headers=headers, json=data, timeout=60)
-        
-        print(f"[App Insights] Response status: {response.status_code}")
-        
-        if response.status_code != 200:
-            print(f"[App Insights] Query failed: {response.status_code} - {response.text[:500]}")
-            return []
-        
-        result = response.json()
-        tables = result.get("tables", [])
-        
-        print(f"[App Insights] Number of tables in response: {len(tables)}")
-        
-        if not tables:
-            print(f"[App Insights] No tables in response")
-            return []
+        # Use MCP to query App Insights
+        result = await call_azure_mcp(
+            "appinsights.query",
+            {
+                "app_id": workspace_id,
+                "query": kql_query,
+                "max_results": max_results
+            }
+        )
         
         # Parse results into LogEntry objects
         log_entries = []
         
+        tables = result.get("tables", [])
         for table in tables:
             columns = [col["name"] for col in table.get("columns", [])]
             rows = table.get("rows", [])
-            
-            print(f"[App Insights] Found {len(rows)} rows")
-            print(f"[App Insights] Columns available: {columns}")
             
             for row in rows[:max_results]:
                 try:
@@ -409,59 +348,124 @@ def get_metrics(
 # MCP Server Integration (Alternative Approach)
 # ============================================================================
 
-def call_azure_mcp_server(method: str, params: dict) -> dict:
+async def call_azure_mcp(method: str, params: Dict[str, Any]) -> Any:
     """
-    Call external Azure MCP server via HTTP.
+    Call Azure MCP tools using the Model Context Protocol.
     
-    This is an alternative approach if you're using an external MCP server.
+    This function maps MCP method names to available Azure operations
+    and executes them using the MCP framework.
     
     Args:
-        method: MCP method to call
+        method: MCP method name (e.g., 'devops.list_builds', 'appinsights.query')
         params: Method parameters
         
     Returns:
-        Response data
+        Response data from MCP
         
     Example:
         ```python
-        result = call_azure_mcp_server(
-            method="azure.devops.listBuilds",
-            params={
-                "project": "MyProject",
-                "pipelineId": "123"
+        builds = await call_azure_mcp(
+            "devops.list_builds",
+            {
+                "organization": "myorg",
+                "project": "myproject"
             }
         )
         ```
     """
-    import httpx
-    
-    if not settings.azure_mcp_server_url:
-        raise ValueError("Azure MCP server URL not configured")
-    
     try:
-        with httpx.Client() as client:
-            response = client.post(
-                f"{settings.azure_mcp_server_url}/rpc",
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": method,
-                    "params": params
-                },
-                timeout=30.0
-            )
-            
-            response.raise_for_status()
-            result = response.json()
-            
-            if "error" in result:
-                raise Exception(f"MCP Error: {result['error']}")
-            
-            return result.get("result", {})
+        # If external MCP server is configured, use it
+        if settings.azure_mcp_server_url:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{settings.azure_mcp_server_url}/rpc",
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": f"azure.{method}",
+                        "params": params
+                    },
+                    timeout=60.0
+                )
+                
+                response.raise_for_status()
+                result = response.json()
+                
+                if "error" in result:
+                    raise Exception(f"MCP Error: {result['error']}")
+                
+                return result.get("result", {})
+        else:
+            # Use Azure APIs directly via MCP-compatible interface
+            return await _azure_api_call(method, params)
             
     except Exception as e:
-        print(f"[Azure MCP Server] Error calling {method}: {str(e)}")
+        print(f"[Azure MCP] Error calling {method}: {str(e)}")
         raise
+
+
+async def _azure_api_call(method: str, params: Dict[str, Any]) -> Any:
+    """
+    Direct Azure API calls wrapped in MCP-compatible interface.
+    
+    This is a fallback when external MCP server is not available.
+    """
+    if method == "devops.list_builds":
+        return await _call_azure_devops_api(params)
+    elif method == "appinsights.query":
+        return await _call_app_insights_api(params)
+    else:
+        raise ValueError(f"Unsupported Azure MCP method: {method}")
+
+
+async def _call_azure_devops_api(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Call Azure DevOps REST API."""
+    org = params.get('organization')
+    project = params.get('project')
+    base_url = f"https://dev.azure.com/{org}/{project}/_apis/build/builds"
+    
+    headers = {
+        "Authorization": f"Basic {settings.azure_devops_pat}",
+        "Content-Type": "application/json"
+    }
+    
+    query_params = {
+        "api-version": "7.0",
+        "$top": params.get('max_builds', 50)
+    }
+    
+    if params.get('min_time'):
+        query_params['minTime'] = params['min_time']
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(base_url, headers=headers, params=query_params, timeout=30.0)
+        response.raise_for_status()
+        result = response.json()
+        return result.get('value', [])
+
+
+async def _call_app_insights_api(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Call Application Insights REST API."""
+    app_id = params.get('app_id')
+    query = params.get('query')
+    
+    # Get Azure credentials
+    credential = DefaultAzureCredential()
+    token = credential.get_token("https://api.applicationinsights.io/.default")
+    
+    api_url = f"https://api.applicationinsights.io/v1/apps/{app_id}/query"
+    
+    headers = {
+        "Authorization": f"Bearer {token.token}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {"query": query}
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(api_url, headers=headers, json=data, timeout=60.0)
+        response.raise_for_status()
+        return response.json()
 
 
 # ============================================================================

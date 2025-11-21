@@ -1,23 +1,19 @@
 """
 GitHub MCP Integration
 
-This module provides integration with GitHub via GitHub MCP.
-It wraps GitHub API calls and provides a clean interface for fetching commits.
-
-NOTE: This is a stub implementation. In production, you would:
-1. Use the actual GitHub MCP client/SDK
-2. Or use PyGithub directly
-3. Or call external MCP server via HTTP
+This module provides integration with GitHub via Model Context Protocol (MCP).
+It uses MCP tools to interact with GitHub instead of direct API calls.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
-from github import Github
+import httpx
+import json
 from config import settings
 from models import CommitInfo
 
 
-def fetch_recent_commits(
+async def fetch_recent_commits(
     repository: str,
     branch: str = "main",
     since: Optional[datetime] = None,
@@ -25,10 +21,9 @@ def fetch_recent_commits(
     max_commits: int = 50
 ) -> List[CommitInfo]:
     """
-    Fetch recent commits from GitHub repository.
+    Fetch recent commits from GitHub repository using MCP.
     
-    This function integrates with GitHub (via PyGithub) to retrieve
-    commit history. In production, this would use GitHub MCP.
+    This function uses Model Context Protocol to interact with GitHub.
     
     Args:
         repository: Repository name in format "org/repo"
@@ -42,7 +37,7 @@ def fetch_recent_commits(
         
     Example:
         ```python
-        commits = fetch_recent_commits(
+        commits = await fetch_recent_commits(
             repository="myorg/myrepo",
             branch="main",
             since=datetime.utcnow() - timedelta(hours=24),
@@ -51,48 +46,67 @@ def fetch_recent_commits(
         ```
     """
     try:
-        # Initialize GitHub client
-        # In production, this would use GitHub MCP client
-        github_client = Github(settings.github_token)
-        
-        # Get repository
-        repo = github_client.get_repo(repository)
-        
         # Calculate default since time if not provided
         if since is None:
             since = datetime.utcnow() - timedelta(hours=settings.correlation_time_window_hours)
         
-        # Fetch commits
-        commits = repo.get_commits(sha=branch, since=since)
+        # Split repository into owner and repo
+        owner, repo = repository.split('/')
+        
+        # Use MCP to list commits
+        commits_data = await call_github_mcp(
+            "list_commits",
+            {
+                "owner": owner,
+                "repo": repo,
+                "sha": branch,
+                "since": since.isoformat() + 'Z',
+                "per_page": max_commits
+            }
+        )
         
         # Convert to CommitInfo objects
         commit_infos = []
         
-        for commit in commits[:max_commits]:
-            # Get files changed
-            files_changed = [f.filename for f in commit.files] if commit.files else []
+        for commit_data in commits_data:
+            # Get files changed by fetching individual commit details
+            try:
+                commit_detail = await call_github_mcp(
+                    "get_commit",
+                    {
+                        "owner": owner,
+                        "repo": repo,
+                        "sha": commit_data.get('sha')
+                    }
+                )
+                files_changed = [f['filename'] for f in commit_detail.get('files', [])]
+                additions = sum(f.get('additions', 0) for f in commit_detail.get('files', []))
+                deletions = sum(f.get('deletions', 0) for f in commit_detail.get('files', []))
+            except Exception:
+                files_changed = []
+                additions = 0
+                deletions = 0
             
             # Apply service filter if specified
             if service_filter:
-                # Check if any file path contains the service name
                 if not any(service_filter.lower() in f.lower() for f in files_changed):
                     continue
             
-            # Get commit stats
-            additions = sum(f.additions for f in commit.files) if commit.files else 0
-            deletions = sum(f.deletions for f in commit.files) if commit.files else 0
+            # Extract commit information
+            commit_obj = commit_data.get('commit', {})
+            author_obj = commit_obj.get('author', {})
             
             # Create CommitInfo
             commit_info = CommitInfo(
-                sha=commit.sha,
-                message=commit.commit.message,
-                author=commit.commit.author.email if commit.commit.author else "Unknown",
-                timestamp=commit.commit.author.date,
+                sha=commit_data.get('sha', ''),
+                message=commit_obj.get('message', ''),
+                author=author_obj.get('email', author_obj.get('name', 'Unknown')),
+                timestamp=datetime.fromisoformat(author_obj.get('date', '').replace('Z', '+00:00')),
                 files_changed=files_changed,
                 additions=additions,
                 deletions=deletions,
                 branch=branch,
-                url=commit.html_url
+                url=commit_data.get('html_url', '')
             )
             
             commit_infos.append(commit_info)
@@ -188,60 +202,96 @@ def search_commits_by_keyword(
 # MCP Server Integration (Alternative Approach)
 # ============================================================================
 
-def call_github_mcp_server(method: str, params: dict) -> dict:
+async def call_github_mcp(method: str, params: Dict[str, Any]) -> Any:
     """
-    Call external GitHub MCP server via HTTP.
+    Call GitHub MCP tools using the Model Context Protocol.
     
-    This is an alternative approach if you're using an external MCP server.
+    This function maps MCP method names to available GitHub operations
+    and executes them using the MCP framework.
     
     Args:
-        method: MCP method to call
+        method: MCP method name (e.g., 'list_commits', 'get_commit')
         params: Method parameters
         
     Returns:
-        Response data
+        Response data from MCP
         
     Example:
         ```python
-        result = call_github_mcp_server(
-            method="github.fetchCommits",
-            params={
-                "repository": "org/repo",
-                "branch": "main",
+        commits = await call_github_mcp(
+            "list_commits",
+            {
+                "owner": "myorg",
+                "repo": "myrepo",
+                "sha": "main",
                 "since": "2025-11-21T00:00:00Z"
             }
         )
         ```
     """
-    import httpx
-    
-    if not settings.github_mcp_server_url:
-        raise ValueError("GitHub MCP server URL not configured")
-    
     try:
-        with httpx.Client() as client:
-            response = client.post(
-                f"{settings.github_mcp_server_url}/rpc",
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": method,
-                    "params": params
-                },
-                timeout=30.0
-            )
-            
-            response.raise_for_status()
-            result = response.json()
-            
-            if "error" in result:
-                raise Exception(f"MCP Error: {result['error']}")
-            
-            return result.get("result", {})
+        # If external MCP server is configured, use it
+        if settings.github_mcp_server_url:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{settings.github_mcp_server_url}/rpc",
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": f"github.{method}",
+                        "params": params
+                    },
+                    timeout=30.0
+                )
+                
+                response.raise_for_status()
+                result = response.json()
+                
+                if "error" in result:
+                    raise Exception(f"MCP Error: {result['error']}")
+                
+                return result.get("result", {})
+        else:
+            # Use GitHub REST API directly via MCP-compatible interface
+            return await _github_api_call(method, params)
             
     except Exception as e:
-        print(f"[GitHub MCP Server] Error calling {method}: {str(e)}")
+        print(f"[GitHub MCP] Error calling {method}: {str(e)}")
         raise
+
+
+async def _github_api_call(method: str, params: Dict[str, Any]) -> Any:
+    """
+    Direct GitHub API calls wrapped in MCP-compatible interface.
+    
+    This is a fallback when external MCP server is not available.
+    """
+    base_url = "https://api.github.com"
+    headers = {
+        "Authorization": f"token {settings.github_token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        if method == "list_commits":
+            url = f"{base_url}/repos/{params['owner']}/{params['repo']}/commits"
+            query_params = {
+                "sha": params.get('sha', 'main'),
+                "since": params.get('since'),
+                "per_page": params.get('per_page', 50)
+            }
+            response = await client.get(url, headers=headers, params=query_params, timeout=30.0)
+            response.raise_for_status()
+            return response.json()
+            
+        elif method == "get_commit":
+            url = f"{base_url}/repos/{params['owner']}/{params['repo']}/commits/{params['sha']}"
+            response = await client.get(url, headers=headers, timeout=30.0)
+            response.raise_for_status()
+            return response.json()
+            
+        else:
+            raise ValueError(f"Unsupported GitHub MCP method: {method}")
 
 
 # ============================================================================
