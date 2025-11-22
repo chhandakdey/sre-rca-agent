@@ -10,6 +10,8 @@ from typing import Optional, Type, List, Dict, Any
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 import json
+import asyncio
+import concurrent.futures
 
 # Import our models and integrations
 from models import (
@@ -96,13 +98,30 @@ class GitHubCommitFetcherTool(BaseTool):
             if since:
                 since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
             
-            # Fetch commits using GitHub MCP
-            commits = fetch_recent_commits(
-                repository=repository,
-                branch=branch,
-                since=since_dt,
-                service_filter=service_filter
-            )
+            # Fetch commits using GitHub MCP (async function)
+            # Handle both sync and async contexts
+            try:
+                loop = asyncio.get_running_loop()
+                # Already in async context
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        fetch_recent_commits(
+                            repository=repository,
+                            branch=branch,
+                            since=since_dt,
+                            service_filter=service_filter
+                        )
+                    )
+                    commits = future.result()
+            except RuntimeError:
+                # No event loop running
+                commits = asyncio.run(fetch_recent_commits(
+                    repository=repository,
+                    branch=branch,
+                    since=since_dt,
+                    service_filter=service_filter
+                ))
             
             # Build result
             result = GitHubFetchResult(
@@ -115,6 +134,8 @@ class GitHubCommitFetcherTool(BaseTool):
             return result.model_dump_json()
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return json.dumps({
                 "error": str(e),
                 "commits": []
@@ -267,11 +288,28 @@ class AppInsightsLogTool(BaseTool):
                 severity_filter=severity_filter
             )
             
-            # Query logs using Azure MCP
-            logs = query_app_insights_logs(
-                workspace_id=workspace_id,
-                kql_query=kql_query
-            )
+            # Log the query for debugging
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"[AppInsights Tool] Generated KQL query:\n{kql_query}")
+            
+            # Query logs using Azure MCP (async function)
+            # Handle both sync and async contexts
+            try:
+                loop = asyncio.get_running_loop()
+                # Already in async context - need to run in executor
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        query_app_insights_logs(workspace_id=workspace_id, kql_query=kql_query)
+                    )
+                    logs = future.result()
+            except RuntimeError:
+                # No event loop running, safe to use asyncio.run()
+                logs = asyncio.run(query_app_insights_logs(
+                    workspace_id=workspace_id,
+                    kql_query=kql_query
+                ))
             
             # Count errors
             error_count = sum(
@@ -291,6 +329,8 @@ class AppInsightsLogTool(BaseTool):
             return result.model_dump_json()
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return json.dumps({
                 "error": str(e),
                 "logs": []
@@ -334,18 +374,25 @@ class AppInsightsLogTool(BaseTool):
         
         # Add error code filter if provided
         if error_code:
-            error_filter = f"(message contains '{error_code}' or customDimensions contains '{error_code}')"
-            request_filters.append(error_filter)
-            trace_filters.append(error_filter)
-            exception_filters.append(error_filter)
+            # Different tables have different fields for error codes
+            request_error_filter = f"(name contains '{error_code}' or url contains '{error_code}' or customDimensions contains '{error_code}')"
+            trace_error_filter = f"(message contains '{error_code}' or customDimensions contains '{error_code}')"
+            exception_error_filter = f"(message contains '{error_code}' or type contains '{error_code}' or customDimensions contains '{error_code}')"
+            
+            request_filters.append(request_error_filter)
+            trace_filters.append(trace_error_filter)
+            exception_filters.append(exception_error_filter)
         
         # Add keyword filter if provided
         if keywords:
-            keyword_conditions = " or ".join([f"message contains '{kw}'" for kw in keywords])
-            keyword_filter = f"({keyword_conditions})"
-            request_filters.append(keyword_filter)
-            trace_filters.append(keyword_filter)
-            exception_filters.append(keyword_filter)
+            # Different tables have different searchable fields
+            request_keyword_conditions = " or ".join([f"(name contains '{kw}' or url contains '{kw}')" for kw in keywords])
+            trace_keyword_conditions = " or ".join([f"message contains '{kw}'" for kw in keywords])
+            exception_keyword_conditions = " or ".join([f"(message contains '{kw}' or type contains '{kw}')" for kw in keywords])
+            
+            request_filters.append(f"({request_keyword_conditions})")
+            trace_filters.append(f"({trace_keyword_conditions})")
+            exception_filters.append(f"({exception_keyword_conditions})")
         
         # Add severity filter only for traces (not applicable to requests)
         if severity_filter:

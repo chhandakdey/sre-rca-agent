@@ -218,7 +218,7 @@ class OrchestratorAgent:
     
     async def _fetch_devops_data(self, execution_ctx: AgentExecutionContext) -> AgentResult:
         """
-        Fetch Azure DevOps deployment data.
+        Fetch deployment data from GitHub Actions.
         
         Args:
             execution_ctx: Execution context
@@ -229,49 +229,52 @@ class OrchestratorAgent:
         start_time = datetime.utcnow()
         
         try:
-            # Calculate time range
-            since = execution_ctx.parsed_context.timestamp - \
-                   asyncio.create_task(asyncio.sleep(0))  # dummy await for async
+            # Use GitHub Actions for deployments
+            from integrations.github_mcp import fetch_recent_deployments
             from datetime import timedelta
-            since = execution_ctx.parsed_context.timestamp - \
-                   timedelta(hours=settings.correlation_time_window_hours)
+            from models import DeploymentCheckResult
             
-            # Invoke DevOps tool
-            result_json = self.devops_tool._run(
-                project=settings.github_org,  # Use as project name
-                pipeline_name=execution_ctx.parsed_context.service_name,
-                since=since.isoformat() + 'Z'
+            # Get repository from settings
+            repository = f"{settings.github_org}/{settings.github_repo}"
+            
+            # Fetch deployments using incident time and correlation window
+            deployments = await fetch_recent_deployments(
+                repository=repository,
+                incident_time=execution_ctx.parsed_context.timestamp,
+                max_results=50
             )
             
-            # Parse result
-            result_data = parse_tool_output(result_json)
+            # Count recent failures
+            recent_failures = sum(
+                1 for dep in deployments 
+                if dep.status.value in ["failed", "cancelled"]
+            )
             
-            # Convert to model
-            from models import DeploymentCheckResult, DeploymentInfo
-            
-            deployments = []
-            for dep_data in result_data.get("deployments", []):
-                try:
-                    deployment = DeploymentInfo(**dep_data)
-                    deployments.append(deployment)
-                except Exception:
-                    continue
+            # Find last successful deployment
+            last_successful = None
+            for dep in sorted(deployments, key=lambda d: d.completed_time, reverse=True):
+                if dep.status.value == "succeeded":
+                    last_successful = dep
+                    break
             
             deployment_result = DeploymentCheckResult(
                 deployments=deployments,
-                recent_failures=result_data.get("recent_failures", 0),
-                last_successful_deployment=None
+                recent_failures=recent_failures,
+                last_successful_deployment=last_successful
             )
             
             execution_time = (datetime.utcnow() - start_time).total_seconds()
             
             return AgentResult(
-                agent_name="azure_devops_deployment",
+                agent_name="github_deployments",
                 success=True,
                 data=deployment_result,
                 error=None,
                 execution_time=execution_time,
-                metadata={}
+                metadata={
+                    "source": "github_actions",
+                    "repository": repository
+                }
             )
             
         except Exception as e:

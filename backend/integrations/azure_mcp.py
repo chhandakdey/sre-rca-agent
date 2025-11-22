@@ -13,15 +13,191 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import httpx
 import json
-from azure.identity import DefaultAzureCredential
+import logging
+import asyncio
+from azure.identity import DefaultAzureCredential, ClientSecretCredential, get_bearer_token_provider
+from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.stdio import stdio_client
 
 from config import settings
 from models import DeploymentInfo, DeploymentStatus, LogEntry, SeverityLevel
 
+# Setup logging
+logger = logging.getLogger(__name__)
+
+# Global MCP session (will be initialized on first use)
+_mcp_session: Optional[ClientSession] = None
+_mcp_session_lock = asyncio.Lock()
+_available_tools: List[Dict[str, Any]] = []
+_stdio_context = None
+_session_context = None
+
 
 # ============================================================================
-# Azure DevOps Integration
+# MCP Session Management
 # ============================================================================
+
+async def initialize_azure_mcp() -> ClientSession:
+    """
+    Initialize Azure MCP client session using stdio transport.
+    
+    Returns:
+        Initialized ClientSession
+    """
+    global _mcp_session, _available_tools, _stdio_context, _session_context
+    
+    async with _mcp_session_lock:
+        if _mcp_session is not None:
+            return _mcp_session
+        
+        try:
+            logger.info("Initializing Azure MCP client session...")
+            
+            # MCP server configuration
+            server_params = StdioServerParameters(
+                command="npx",
+                args=["-y", "@azure/mcp@latest", "server", "start"],
+                env=None
+            )
+            
+            # Create stdio client connection - enter the context and keep it alive
+            _stdio_context = stdio_client(server_params)
+            read, write = await _stdio_context.__aenter__()
+            
+            # Create and initialize session - enter session context
+            _session_context = ClientSession(read, write)
+            await _session_context.__aenter__()
+            await _session_context.initialize()
+            
+            # List and cache available tools
+            tools_response = await _session_context.list_tools()
+            _available_tools = [{
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema
+                }
+            } for tool in tools_response.tools]
+            
+            logger.info(f"Azure MCP initialized with {len(_available_tools)} tools")
+            for tool in tools_response.tools:
+                logger.debug(f"  - {tool.name}")
+            
+            _mcp_session = _session_context
+            return _session_context
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Azure MCP: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+
+async def get_azure_mcp_session() -> ClientSession:
+    """
+    Get or create Azure MCP session.
+    
+    Returns:
+        Active ClientSession
+    """
+    global _mcp_session
+    
+    if _mcp_session is None:
+        await initialize_azure_mcp()
+    
+    return _mcp_session
+
+
+async def call_azure_mcp_tool(tool_name: str, arguments: Dict[str, Any]) -> Any:
+    """
+    Call an Azure MCP tool with the given arguments.
+    
+    Args:
+        tool_name: Name of the MCP tool to call
+        arguments: Tool arguments
+        
+    Returns:
+        Tool response content
+        
+    Example:
+        ```python
+        result = await call_azure_mcp_tool(
+            "subscription_list",
+            {}
+        )
+        ```
+    """
+    try:
+        session = await get_azure_mcp_session()
+        
+        logger.debug(f"Calling Azure MCP tool: {tool_name}")
+        logger.debug(f"Arguments: {json.dumps(arguments, indent=2)}")
+        
+        # Call the tool
+        result = await session.call_tool(tool_name, arguments)
+        
+        # Extract text content from result
+        if isinstance(result.content, list):
+            content_text = "\n".join([
+                item.text if hasattr(item, 'text') else str(item) 
+                for item in result.content
+            ])
+        elif hasattr(result.content, 'text'):
+            content_text = result.content.text
+        else:
+            content_text = str(result.content)
+        
+        logger.debug(f"Tool response: {content_text[:500]}...")
+        
+        # Try to parse as JSON if possible
+        try:
+            return json.loads(content_text)
+        except json.JSONDecodeError:
+            return content_text
+            
+    except Exception as e:
+        logger.error(f"Error calling Azure MCP tool {tool_name}: {e}")
+        raise
+
+
+async def close_azure_mcp():
+    """
+    Close Azure MCP session.
+    """
+    global _mcp_session, _stdio_context, _session_context
+    
+    async with _mcp_session_lock:
+        if _mcp_session is not None:
+            try:
+                # Set session to None first to prevent new calls
+                session_to_close = _session_context
+                stdio_to_close = _stdio_context
+                
+                _mcp_session = None
+                _session_context = None
+                _stdio_context = None
+                
+                # Close session context if it exists
+                if session_to_close is not None:
+                    try:
+                        await session_to_close.__aexit__(None, None, None)
+                    except Exception as e:
+                        logger.warning(f"Error closing session context (non-critical): {e}")
+                
+                # Close stdio context if it exists
+                if stdio_to_close is not None:
+                    try:
+                        await stdio_to_close.__aexit__(None, None, None)
+                    except Exception as e:
+                        logger.warning(f"Error closing stdio context (non-critical): {e}")
+                
+                logger.info("Azure MCP session closed")
+            except Exception as e:
+                logger.error(f"Error closing Azure MCP session: {e}")
+
+
+
 
 async def check_deployments(
     project: str,
@@ -131,11 +307,11 @@ async def check_deployments(
         return deployment_infos[:max_results]
         
     except Exception as e:
-        print(f"[Azure DevOps] Error checking deployments: {str(e)}")
+        logger.error(f"[Azure DevOps] Error checking deployments: {str(e)}")
         return []
 
 
-def get_deployment_logs(project: str, build_id: int) -> str:
+async def get_deployment_logs(project: str, build_id: int) -> str:
     """
     Get logs for a specific deployment/build.
     
@@ -147,29 +323,24 @@ def get_deployment_logs(project: str, build_id: int) -> str:
         Build logs as string
     """
     try:
-        credentials = BasicAuthentication('', settings.azure_devops_pat)
-        connection = Connection(
-            base_url=settings.azure_devops_org_url,
-            creds=credentials
+        # Use MCP to get build logs
+        result = await call_azure_mcp(
+            "devops.get_build_logs",
+            {
+                "project": project,
+                "build_id": build_id
+            }
         )
         
-        build_client = connection.clients.get_build_client()
-        logs = build_client.get_build_logs(project=project, build_id=build_id)
-        
-        # Combine log entries
-        log_text = ""
-        for log in logs:
-            log_content = build_client.get_build_log(
-                project=project,
-                build_id=build_id,
-                log_id=log.id
-            )
-            log_text += log_content + "\n"
-        
-        return log_text
+        if isinstance(result, str):
+            return result
+        elif isinstance(result, dict):
+            return json.dumps(result, indent=2)
+        else:
+            return str(result)
         
     except Exception as e:
-        print(f"[Azure DevOps] Error fetching deployment logs: {str(e)}")
+        logger.error(f"[Azure DevOps] Error fetching deployment logs: {str(e)}")
         return ""
 
 
@@ -183,28 +354,83 @@ async def query_app_insights_logs(
     max_results: int = 1000
 ) -> List[LogEntry]:
     """
-    Query Azure App Insights logs using KQL via MCP.
+    Query Azure App Insights logs using KQL via REST API.
     
-    This function uses Model Context Protocol to execute KQL queries.
+    This function queries Application Insights directly using the REST API.
     
     Args:
-        workspace_id: App Insights App ID
+        workspace_id: App Insights App ID (not workspace ID). 
+                     This is a GUID found in the App Insights portal under API Access.
+                     Example: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
         kql_query: KQL query to execute
         max_results: Maximum log entries to return
         
     Returns:
         List of LogEntry objects
+        
+    Note:
+        The workspace_id parameter should be the Application Insights App ID,
+        which is different from the Log Analytics Workspace ID.
+        You can find the App ID in Azure Portal > Application Insights > API Access.
     """
     try:
-        # Use MCP to query App Insights
-        result = await call_azure_mcp(
-            "appinsights.query",
-            {
-                "app_id": workspace_id,
-                "query": kql_query,
-                "max_results": max_results
-            }
-        )
+        # Use direct REST API for App Insights queries
+        logger.info(f"Querying App Insights with App ID: {workspace_id}")
+        logger.debug(f"KQL Query: {kql_query}")
+        
+        # Check if we have the app_id configured
+        from config import settings
+        app_id = settings.app_insights_app_id or workspace_id
+        
+        if not app_id or app_id == workspace_id and len(workspace_id) != 36:
+            logger.warning(f"App ID might be invalid. Expected format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+            logger.warning(f"Received: {workspace_id}")
+            logger.info(f"Trying to use workspace_id from settings: {settings.app_insights_workspace_id}")
+        
+        # Get credentials
+        credential = DefaultAzureCredential()
+        
+        # Get access token for Application Insights
+        token = credential.get_token("https://api.applicationinsights.io/.default")
+        
+        # Make direct API call - use app_id (not workspace_id)
+        api_url = f"https://api.applicationinsights.io/v1/apps/{app_id}/query"
+        
+        headers = {
+            "Authorization": f"Bearer {token.token}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "query": kql_query
+        }
+        
+        logger.debug(f"Making request to: {api_url}")
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(api_url, json=payload, headers=headers)
+            
+            if response.status_code == 404:
+                logger.error(f"[App Insights] 404 Not Found - App ID '{app_id}' is invalid or doesn't exist")
+                logger.error(f"Please check:")
+                logger.error(f"  1. APP_INSIGHTS_APP_ID is set correctly in .env")
+                logger.error(f"  2. The App ID (not Workspace ID) from Azure Portal > Application Insights > API Access")
+                logger.error(f"  3. Your credentials have access to this Application Insights resource")
+                raise ValueError(f"Invalid Application Insights App ID: {app_id}")
+            
+            if response.status_code == 400:
+                logger.error(f"[App Insights] 400 Bad Request - Invalid query or request format")
+                logger.error(f"Response body: {response.text}")
+                logger.error(f"KQL Query sent: {kql_query}")
+                try:
+                    error_details = response.json()
+                    logger.error(f"Error details: {json.dumps(error_details, indent=2)}")
+                except:
+                    pass
+                raise ValueError(f"Invalid Application Insights query: {response.text}")
+            
+            response.raise_for_status()
+            result = response.json()
         
         # Parse results into LogEntry objects
         log_entries = []
@@ -300,14 +526,14 @@ async def query_app_insights_logs(
                     log_entries.append(log_entry)
                     
                 except Exception as e:
-                    print(f"[App Insights] Error parsing row: {str(e)}")
+                    logger.error(f"[App Insights] Error parsing row: {str(e)}")
                     continue
         
-        print(f"[App Insights] Successfully parsed {len(log_entries)} log entries")
+        logger.info(f"[App Insights] Successfully parsed {len(log_entries)} log entries")
         return log_entries
         
     except Exception as e:
-        print(f"[App Insights] Error querying logs: {str(e)}")
+        logger.error(f"[App Insights] Error querying logs: {str(e)}")
         import traceback
         traceback.print_exc()
         return []
@@ -340,20 +566,19 @@ def get_metrics(
         }
         
     except Exception as e:
-        print(f"[Azure Monitor] Error fetching metrics: {str(e)}")
+        logger.error(f"[Azure Monitor] Error fetching metrics: {str(e)}")
         return {"metrics": [], "error": str(e)}
 
 
 # ============================================================================
-# MCP Server Integration (Alternative Approach)
+# MCP Server Integration
 # ============================================================================
 
 async def call_azure_mcp(method: str, params: Dict[str, Any]) -> Any:
     """
     Call Azure MCP tools using the Model Context Protocol.
     
-    This function maps MCP method names to available Azure operations
-    and executes them using the MCP framework.
+    This function maps method names to Azure MCP tool names and executes them.
     
     Args:
         method: MCP method name (e.g., 'devops.list_builds', 'appinsights.query')
@@ -374,34 +599,25 @@ async def call_azure_mcp(method: str, params: Dict[str, Any]) -> Any:
         ```
     """
     try:
-        # If external MCP server is configured, use it
-        if settings.azure_mcp_server_url:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{settings.azure_mcp_server_url}/rpc",
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": f"azure.{method}",
-                        "params": params
-                    },
-                    timeout=60.0
-                )
-                
-                response.raise_for_status()
-                result = response.json()
-                
-                if "error" in result:
-                    raise Exception(f"MCP Error: {result['error']}")
-                
-                return result.get("result", {})
-        else:
-            # Use Azure APIs directly via MCP-compatible interface
-            return await _azure_api_call(method, params)
+        # Map method names to actual MCP tool names
+        tool_mapping = {
+            "devops.list_builds": "azd",  # Azure Developer CLI
+            "appinsights.query": "monitor",  # Azure Monitor for querying logs
+            "monitor.query": "monitor",
+        }
+        
+        # Get the actual tool name or use the method as-is
+        tool_name = tool_mapping.get(method, method)
+        
+        # Call the MCP tool using our session
+        result = await call_azure_mcp_tool(tool_name, params)
+        
+        return result
             
     except Exception as e:
-        print(f"[Azure MCP] Error calling {method}: {str(e)}")
-        raise
+        logger.error(f"[Azure MCP] Error calling {method}: {str(e)}")
+        # Fallback to direct API calls if MCP fails
+        return await _azure_api_call(method, params)
 
 
 async def _azure_api_call(method: str, params: Dict[str, Any]) -> Any:

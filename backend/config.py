@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     correlation_max_results: int = 10
     enable_ml_correlation: bool = True
     
+    # Deployment Correlation Settings
+    deployment_correlation_hours: int = 2
+    
     # MCP Server URLs (optional - for external MCP servers)
     azure_mcp_server_url: Optional[str] = None
     github_mcp_server_url: Optional[str] = None
